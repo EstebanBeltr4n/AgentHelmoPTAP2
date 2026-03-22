@@ -1,119 +1,77 @@
-// ===== Emisor PH (ID = 1) =====
-#define NODE_ID 1
-#define NODE_TYPE "PH"
+// ===== EMISOR pH HELMO PTAP - NODO ID=1 =====
+// Archivo: emitter_ph.ino
+// Autor: Esteban Eduardo Escarraga Tuquerres
+// Fecha: 21 Marzo 2026 - Proyecto académico calidad agua potable
+// Propósito: Nodo LoRa pH-4502C → Central MySQL ML análisis
 
-#include <RadioLib.h>
-#include <Wire.h>
-#include "HT_SSD1306Wire.h"
-#include "mbedtls/aes.h"
+#include "config_ph.h"                          // Constantes + calibración
+#include "ph_ml.cpp"                            // Funciones sensor/LoRa
 
-const unsigned char aes_key[16] = {
-  'E','s','t','e','b','a','n','L','o','R','a','2','0','2','6','!'
-};
-
-#define SDA_OLED 17
-#define SCL_OLED 18
-#define RST_OLED 21
-#define VEXT_PIN 36
-
-#define LORA_CS   8
-#define LORA_SCK  9
-#define LORA_MOSI 10
-#define LORA_MISO 11
-#define LORA_RST  12
-#define LORA_BUSY 13
-#define LORA_DIO1 14
-
-// PH-4502C: salida analógica PO -> pin ADC
-#define SENSOR_PH_PIN 2
-
-SSD1306Wire pantalla(0x3c, 500000, SDA_OLED, SCL_OLED,
-                     GEOMETRY_128_64, RST_OLED);
-SX1262* lora;
-
-float ema = 7.0;
-float tendencia = 0.0;
-float hist[10];
-int idxHist = 0;
-int nHist = 0;
+// 📊 Variables control envío
+float ultimo_ph = 7.0;                          // Último valor pH
+unsigned long ultimo_envio_ph = 0;              // Timestamp envío LoRa
+const unsigned long INTERVALO_PH = 4000;        // 4 segundos intervalo
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(115200);                         // Monitor serie debug
   delay(1000);
+  
+  Serial.println("🚀 EMISOR pH HELMO ID=1");
+  Serial.println("🎓 Proyecto PTAP Smart 2026");
 
-  pinMode(VEXT_PIN, OUTPUT);
-  digitalWrite(VEXT_PIN, LOW);
+  // 🔌 Inicialización hardware
+  pinMode(VEXT_PIN, OUTPUT);                    // Control power sensor
+  digitalWrite(VEXT_PIN, LOW);                  // Power off inicial
   delay(100);
+  digitalWrite(VEXT_PIN, HIGH);                 // Power on sensor pH
 
+  // 🖥️ Pantalla OLED boot
   pantalla.init();
   pantalla.clear();
   pantalla.setFont(ArialMT_Plain_10);
-  pantalla.drawString(0, 0, "Nodo PH ID 1");
+  pantalla.drawString(0, 0, "HELMO pH ID:1");
+  pantalla.drawString(0, 15, "PTAP Calidad 2026");
   pantalla.display();
 
-  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
-  Module* radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY, SPI);
-  lora = new SX1262(radio);
-
-  // ✅ BIEN (todos usan 0x12)
-  int state = lora->begin(915.0, 125.0, 7, 5, 0x12, 22, 8, 1.6);
-  
-  if (state == RADIOLIB_ERR_NONE) {
-    Serial.println("LoRa PH OK");
-  } else {
-    Serial.print("LoRa error: "); Serial.println(state);
+  // 📡 Radio LoRa inicialización
+  if (!inicializarLoRaPH()) {
+    Serial.println("✗ CRÍTICO: LoRa pH falló");
+    while(1);                                   // Freeze si no radio
   }
-
-  pinMode(SENSOR_PH_PIN, INPUT);
+  
+  Serial.println("✅ Nodo pH operacional");
+  delay(2000);
 }
 
 void loop() {
-  int raw = analogRead(SENSOR_PH_PIN);
-  float volt = raw * 3.3 / 4095.0;
-
-  // Aproximación, deberás calibrar
-  float ph = 7.0 + ((2.5 - volt) / 0.18);
-
-  float val = ph;
-  ema = 0.3 * val + 0.7 * ema;
-
-  hist[idxHist] = val;
-  idxHist = (idxHist + 1) % 10;
-  if (nHist < 10) nHist++;
-
-  if (nHist >= 3) {
-    float v0 = hist[(idxHist + 9) % 10];
-    float v1 = hist[(idxHist + 8) % 10];
-    float v2 = hist[(idxHist + 7) % 10];
-    float avg = (v0 + v1 + v2) / 3.0;
-    tendencia = avg - ema;
+  // ⏰ Control intervalo anti-spam LoRa
+  if (millis() - ultimo_envio_ph >= INTERVALO_PH) {
+    
+    // 1. 🧪 LECTURA SENSOR
+    float ph_actual = leerSensorPH();           // ADC → pH calibrado
+    
+    // 2. 🧠 MODELO LOCAL
+    actualizarModeloPH(ph_actual);              // EMA + tendencia
+    
+    // 3. 📊 CLASIFICACIÓN
+    String estado_ph = clasificarEstadoPH(ph_actual);
+    
+    // 4. 📡 TRANSMISIÓN LoRa
+    int tx_result = enviarPaqueteLoRaPH(ph_actual, tendencia_ph);
+    
+    // 5. 🖥️ VISUALIZACIÓN
+    actualizarOLED_PH(ph_actual, ultimo_ph * ADC_VREF / ADC_RESOLUTION, estado_ph);
+    
+    // 📈 LOG ACADÉMICO COMPLETO
+    Serial.println("========== HELMO pH ==========");
+    Serial.printf("pH: %.2f | EMA: %.2f | Tend: %.3f\n", ph_actual, ema_ph, tendencia_ph);
+    Serial.println(estado_ph);
+    Serial.printf("LoRa: %s\n", tx_result == RADIOLIB_ERR_NONE ? "OK" : "ERROR");
+    Serial.println("=============================");
+    
+    ultimo_ph = ph_actual;                      // Guardar estado
+    ultimo_envio_ph = millis();                 // Reset temporizador
   }
-
-  String payload = String(NODE_ID) + "," +
-                   String(val, 2) + "," +
-                   String(tendencia, 3);
-
-  unsigned char plain[16] = {0};
-  payload.getBytes(plain, 16);
-
-  unsigned char enc[16];
-  mbedtls_aes_context aes;
-  mbedtls_aes_init(&aes);
-  mbedtls_aes_setkey_enc(&aes, aes_key, 128);
-  mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, plain, enc);
-  mbedtls_aes_free(&aes);
-
-  int txState = lora->transmit(enc, 16);
-  Serial.print("TX PH: "); Serial.println(payload);
-  Serial.print("TX Estado: "); Serial.println(txState);
-
-  pantalla.clear();
-  pantalla.setFont(ArialMT_Plain_10);
-  pantalla.drawString(0, 0, "pH:" + String(ph, 2) +
-                           " V:" + String(volt, 2));
-  pantalla.drawString(0, 14, "EMA:" + String(ema, 2));
-  pantalla.drawString(0, 28, "Trend:" + String(tendencia, 3));
-  pantalla.display();
-
-  delay(4000);
+  
+  delay(100);                                   // Estabilidad loop
 }
