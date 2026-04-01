@@ -1,270 +1,470 @@
-// ===== CENTRAL HELMO LoRa + MySQL + ML EMBEBIDO =====
-// Archivo: central_node.ino
-// Propósito: Nodo central PTAP - Loop abierto (operario decide), ML predictivo
+/* ============================================================================
+   NODO CENTRAL - AGENTE OBJETO (SISTEMA MULTI-AGENTE HELMO)
+   ============================================================================
+   Autor: Esteban Eduardo Escarraga
+   Descripción: Este nodo actúa como el Agente Central (Coordinador)
+   dentro de una arquitectura distribuida para el monitoreo de PTAP.
+   
+   Fase actual (Pruebas Edge): Recepción asíncrona LoRa, desencriptación AES-128,
+   demultiplexación de sensores y visualización en tiempo real vía WebServer local
+   (Persistencia en base de datos temporalmente desactivada para validación de RF).
 
-#include <RadioLib.h>                          // LoRa SX1262
-#include <WiFi.h>                              // WiFi AP seguro
-#include <WebServer.h>                         // Servidor web PTAP
-#include <Wire.h>                              // I2C OLED
-#include "HT_SSD1306Wire.h"                    // Driver OLED Heltec
-#include "mbedtls/aes.h"                       // Cifrado AES datos LoRa
-#include <ESP32Servo.h>                        // Servo actuadores
-#include <MySQL_Connection.h>                  // MySQL Arduino
-#include <MySQL_Cursor.h>                      // Queries MySQL
-#include "config_central.h"                    // Pines y credenciales
-#include "mysql_helpers.cpp"                   // Funciones MySQL/ML
+   Fecha: 31 de marzo de 2026
+   
+   Hardware: Heltec ESP32-S3 LoRa32 V3
+   ============================================================================ */
 
-// 🔑 CLAVE AES (16 bytes para AES-128)
+#define NODE_ID 3 // Identificador lógico del Nodo Central en la topología de red
+
+// --- INCLUSIÓN DE LIBRERÍAS CORE ---
+#include <RadioLib.h>       // Gestión del stack físico de LoRa (Chip SX1262)
+#include <WiFi.h>           // Pila TCP/IP para la conexión inalámbrica local
+#include <WebServer.h>      // Implementación del servidor HTTP embebido
+#include <Wire.h>           // Protocolo de comunicación I2C
+#include "HT_SSD1306Wire.h" // Controlador gráfico para la pantalla OLED integrada
+#include "mbedtls/aes.h"    // Aceleración criptográfica por hardware (AES)
+#include <ESP32Servo.h>     // Control de actuadores PWM (Servomotores)
+
+// ========= CAPA DE SEGURIDAD: LLAVE SIMÉTRICA (AES-128) =========
+// Clave privada compartida (PSK) entre todos los nodos para evitar suplantación (Spoofing)
 const unsigned char aes_key[16] = {
-  'E','s','t','e','b','a','n','L','o','R','a','2','0','2','6','!'
+  'E', 's', 't', 'e', 'b', 'a', 'n', 'L', 'o', 'R', 'a', '2', '0', '2', '6', '!'
 };
 
-// 📡 Objetos globales
-SSD1306Wire pantalla(0x3c, 500000, SDA_OLED, SCL_OLED, GEOMETRY_128_64, RST_OLED);
-SX1262* lora;                                  // LoRa radio
-WebServer server(80);                          // Web port 80
-Servo servoTurbidez;                           // Servo turbidez
+// ========= MAPEO DE HARDWARE (HELTEC V3 - ESP32-S3) =========
+// Interfaz HMI Local
+#define SDA_OLED 17         // Línea de datos I2C para OLED
+#define SCL_OLED 18         // Línea de reloj I2C para OLED
+#define RST_OLED 21         // Pin de reinicio de la pantalla
+#define VEXT_PIN 36         // Control de potencia para periféricos (Vext)
 
-// 📊 Datos sensores (globales para web/OLED/MySQL)
-float turb_val = 0, turb_raw = 0;              // Turbidez + voltaje RAW
-float ph_val = 7.0;                            // pH agua
-float nivel_val = 0, nivel_dist_cm = 0, nivel_altura_real = 0;  // Nivel calculado
-String estadoGlobal = "SIN DATOS";             // Estado general sistema
-String accionRecomendada = "INICIANDO";        // Recomendación operario
-float turb_prediccion_ml = 0;                  // Predicción ML próxima hora
+// Bus SPI dedicado al Transceptor LoRa SX1262
+#define LORA_CS 8           // Chip Select
+#define LORA_SCK 9          // Serial Clock
+#define LORA_MOSI 10        // Master Out Slave In
+#define LORA_MISO 11        // Master In Slave Out
+#define LORA_RST 12         // Reset del módulo de radio
+#define LORA_BUSY 13        // Pin de estado de ocupado del SX1262
+#define LORA_DIO1 14        // Pin de interrupción de hardware (RX Done)
 
-// 📡 Variables LoRa
-volatile bool receivedFlag = false;            // Flag interrupción LoRa
-uint8_t rxBuffer[32];                          // Buffer recepción desencriptado
+// Asignación de Actuadores (Sistema de Control Reactivo)
+#define SERVO_TURBIDEZ 4    // Válvula simulada para derivación de agua
+#define LED_NIVEL_BAJO 38   // Indicador visual de alerta de estanque vacío
+#define BUZZER_ALERTA 2     // Señal acústica unificada de fallas
 
-// ⚡ Interrupción LoRa (ISR optimizada ESP32)
-#if defined(ESP32)
-IRAM_ATTR
-#endif
-void setFlag(void) {
-  receivedFlag = true;                         // Marcar recepción
+// ========= CONFIGURACIÓN DE RED (WIFI) =========
+// Credenciales de la red local para el acceso al panel de control web
+const char* WIFI_SSID = "Phepe"; 
+const char* WIFI_PASS = "bbq7W5ha";
+
+// ========= PARÁMETROS DE EDGE COMPUTING (MACHINE LEARNING) =========
+const int ML_VENTANA_TURB = 12;       // Tamaño del buffer circular para promedios móviles
+const float ML_HORAS_ADELANTE = 1.0;  // Horizonte predictivo (Delta de tiempo)
+
+// ========= INSTANCIACIÓN DE OBJETOS GLOBALES =========
+SSD1306Wire pantalla(0x3c, 500000, SDA_OLED, SCL_OLED, GEOMETRY_128_64, RST_OLED); // Pantalla
+SX1262* lora;                         // Puntero dinámico al módulo de radio
+WebServer server(80);                 // Servidor HTTP en el puerto estándar 80
+Servo servoTurbidez;                  // Objeto controlador del servo
+
+// --- VARIABLES DE ESTADO Y TELEMETRÍA (RAM) ---
+// Variables globales que almacenan el último estado conocido de cada agente
+float turb_ntu = 0, turb_raw = 0, turb_trend = 0;
+float ph_val = 7.0, ph_trend = 0;
+float dist_cm = 0, altura_real = 0;
+
+// Estados lógicos inferidos por el sistema
+String estadoGlobal = "SIN DATOS";
+String accionRecomendada = "INICIANDO";
+
+// Banderas de control para interrupciones por hardware (ISR)
+volatile bool receivedFlag = false; // Flag atómica para indicar llegada de paquete
+uint8_t rxBuffer[32];               // Buffer de recepción del payload LoRa cifrado
+
+// Variables para el modelo algorítmico local
+float turb_ventana[ML_VENTANA_TURB];
+int turb_idx = 0;
+float turb_prediccion = 0;
+
+// ========= ESTRUCTURA DE PERSISTENCIA EN MEMORIA VOLÁTIL (RAM) =========
+// Al prescindir temporalmente de MySQL, usamos una cola circular en RAM
+// para nutrir la tabla del panel web en tiempo real.
+const int HIST_MAX = 40; // Número máximo de filas a mostrar en la web
+
+// Estructura de datos (Struct) para estandarizar cada paquete recibido
+struct Registro {
+  unsigned long ts;   // Marca de tiempo (Timestamp local en milisegundos)
+  int sensor_id;      // Origen del dato (0=Turbidez, 1=Nivel, 2=pH)
+  float turb_ntu_;    // Valor encapsulado
+  float turb_raw_;
+  float dist_cm_;
+  float altura_;
+  float ph_;
+};
+
+Registro hist[HIST_MAX]; // Array estructurado (Historial)
+int hist_idx = 0;        // Puntero de escritura (Cola circular)
+int hist_count = 0;      // Contador absoluto de elementos
+
+// Función que inyecta los datos recién llegados a la estructura en RAM
+void addHist(int sensor_id, float turb, float raw, float dist, float alt, float ph) {
+  Registro& r = hist[hist_idx]; // Referencia directa a la posición actual
+  r.ts = millis();
+  r.sensor_id = sensor_id;
+  r.turb_ntu_ = turb;
+  r.turb_raw_ = raw;
+  r.dist_cm_ = dist;
+  r.altura_ = alt;
+  r.ph_ = ph;
+
+  // Lógica de cola circular: Si llega al límite (40), sobrescribe el más antiguo
+  hist_idx = (hist_idx + 1) % HIST_MAX;
+  if (hist_count < HIST_MAX) hist_count++;
 }
 
-void setup() {
-  Serial.begin(115200);                        // Monitor serie debug
-  delay(1000);
-  Serial.println("🚀 HELMO CENTRAL PTAP v2.0 - ML+MySQL");
+// ========= PROTOTIPOS DE FUNCIONES =========
+// Declaración anticipada de rutinas para correcta compilación en C++
+void controlarActuadores();
+void evaluarEstado();
+void actualizarOLED();
+void webCompleta();
+void actualizarML_Turbidez(float nueva_lectura);
+float calcularPrediccion();
 
-  // 🔌 Hardware inicialización
-  pinMode(VEXT_PIN, OUTPUT);                   // Alimentación sensores
-  digitalWrite(VEXT_PIN, LOW);
+// ========= MANEJADOR DE INTERRUPCIONES (ISR) =========
+// Esta función se ejecuta a nivel de hardware cuando el pin DIO1 detecta una onda LoRa
+#if defined(ESP32)
+IRAM_ATTR // Fuerza la carga de la función en la memoria RAM ultrarrápida (IRAM)
+#endif
+void setFlag(void) {
+  receivedFlag = true; // Levanta la bandera sin bloquear el procesador principal
+}
+
+// ================= RUTINA DE INICIALIZACIÓN (SETUP) =================
+void setup() {
+  Serial.begin(115200); // Puerto serie para depuración (Baud rate estándar ESP32)
+  delay(1000);
+  Serial.println("=== CENTRAL OBJETIVO V2 (Fase Pruebas Edge) ===");
+
+  // 1. Inicialización de la gestión de energía
+  pinMode(VEXT_PIN, OUTPUT);
+  digitalWrite(VEXT_PIN, LOW); // Enciende riel de poder para periféricos
   delay(100);
 
-  // 🖥️ OLED inicialización
+  // 2. Inicialización de Interfaz Local (OLED)
   pantalla.init();
   pantalla.clear();
   pantalla.setFont(ArialMT_Plain_10);
-  pantalla.drawString(0, 0, "HELMO Central PTAP");
-  pantalla.drawString(0, 15, "ML + MySQL Ready");
+  pantalla.drawString(0, 0, "Central Objetivo V2");
   pantalla.display();
 
-  // 📡 LoRa configuración (parámetros estándar HELMO)
-  SPI.begin(9, 11, 10, 8);                     // SPI pines Heltec V3
-  Module* radio = new Module(8, 14, 12, 13);   // CS,DIO1,RST,BUSY
+  // 3. Configuración del Transceptor LoRa (SX1262)
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS); // Asigna pines al bus SPI
+  Module* radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY, SPI);
   lora = new SX1262(radio);
-  
-  int state = lora->begin(LORA_FREQ, LORA_BW, LORA_SF, LORA_CR, 
-                         LORA_SYNC, LORA_POWER, LORA_CURRENT, LORA_RSSI);
+
+  // Parámetros RF: 915MHz, 125kHz Bandwidth, SF 7, SyncWord Privado (0x12)
+  int state = lora->begin(915.0, 125.0, 7, 5, 0x12, 22, 8, 1.6);
   if (state == RADIOLIB_ERR_NONE) {
-    lora->setDio1Action(setFlag);              // Habilitar interrupciones
-    lora->startReceive();                      // Modo RX continuo
-    Serial.println("✓ LoRa 915MHz configurado");
+    lora->setDio1Action(setFlag); // Vincula la interrupción al pin
+    lora->startReceive();         // Pone el radio en modo escucha perpetua (RX Continuo)
+    Serial.println("LoRa OK - Escuchando...");
   } else {
-    Serial.print("✗ LoRa error: "); Serial.println(state);
-    while(1);                                  // Parar si falla LoRa
+    Serial.print("Error Crítico LoRa: "); Serial.println(state);
+    while (1); // Bucle infinito de seguridad si el hardware RF falla
   }
 
-  // 🎛️ Actuadores (loop abierto - operario PTAP controla vía web)
-  pinMode(LED_NIVEL_BAJO, OUTPUT);             // LED visual
-  pinMode(BUZZER_ALERTA, OUTPUT);              // Audio alerta
+  // 4. Configuración de Puertos para Actuadores (Output)
+  pinMode(LED_NIVEL_BAJO, OUTPUT);
+  pinMode(BUZZER_ALERTA, OUTPUT);
   digitalWrite(LED_NIVEL_BAJO, LOW);
   digitalWrite(BUZZER_ALERTA, LOW);
-  
-  servoTurbidez.attach(SERVO_TURBIDEZ);        // Servo señal
-  servoTurbidez.write(0);                      // Posición inicial ABIERTO
+  servoTurbidez.attach(SERVO_TURBIDEZ); // Vincula el objeto Servo al pin físico
+  servoTurbidez.write(0);               // Posición inicial (Válvula cerrada)
 
-  // 🔐 WiFi AP seguro (operario PTAP se conecta desde celular)
-  WiFi.softAP(WIFI_SSID, WIFI_PASS);
-  IPAddress ip = WiFi.softAPIP();
-  Serial.print("📱 Web PTAP: http://"); Serial.println(ip);
+  // 5. Conexión a Infraestructura de Red (WiFi)
+  WiFi.mode(WIFI_STA); // Modo Estación (Cliente de un router)
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
 
-  // 🌐 Servidor web con autenticación
-  server.on("/", webCompletaPTAP);             // Ruta principal protegida
-  server.begin();
+  Serial.print("Conectando WiFi");
+  while (WiFi.status() != WL_CONNECTED) { // Espera activa hasta obtener IP
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi Conectado!");
+  Serial.print("🌐 Accede al panel web en: ");
+  Serial.println(WiFi.localIP());
 
-  // 🗄️ MySQL conexión (persistencia para ML)
-  conectarMySQL();                             // Inicializar base datos
+  // 6. Configuración de Rutas del Servidor HTTP Embebido
+  server.on("/", []() {
+    // Capa de Seguridad de Red: Autenticación básica HTTP (Login)
+    if (!server.authenticate("admin", "ptap2026!")) {
+      return server.requestAuthentication(); // Despliega el cuadro de usuario/contraseña
+    }
+    webCompleta(); // Si las credenciales son correctas, despacha el HTML
+  });
+  server.begin(); // Pone el servidor web online
 
-  // 🖥️ OLED estado final
+  // Muestra la IP asignada en la pantalla física para fácil acceso
+  IPAddress ip = WiFi.localIP();
   pantalla.clear();
-  pantalla.drawString(0, 0, "Web: " + ip.toString());
-  pantalla.drawString(0, 15, "MySQL: " + String(mysql_conectado ? "OK" : "OFF"));
+  pantalla.drawString(0, 0, "PTAP Central");
+  pantalla.drawString(0, 15, "IP: " + ip.toString());
   pantalla.display();
+  
+  // Limpieza inicial del buffer de algoritmos predictivos
+  for (int i = 0; i < ML_VENTANA_TURB; i++) turb_ventana[i] = 0;
 }
 
+// ================= BUCLE PRINCIPAL (MÁQUINA DE ESTADOS) =================
 void loop() {
-  server.handleClient();                       // Procesar peticiones web
+  // 1. Escucha activa de peticiones web HTTP (Clientes entrando al dashboard)
+  server.handleClient();
 
-  // 📡 Procesar paquetes LoRa recibidos
+  // 2. Procesamiento de Telemetría (Disparado por Interrupción LoRa)
   if (receivedFlag) {
-    receivedFlag = false;
-    Serial.println("\n📡 Paquete LoRa recibido");
+    receivedFlag = false; // Baja la bandera para permitir futuras interrupciones
+    Serial.println("\n📡 Evento de Recepción (RX) Detectado");
 
-    // Leer y desencriptar datos
-    int state = lora->readData(rxBuffer, 32);
+    // Copia los datos del chip LoRa al microcontrolador ESP32
+    int state = lora->readData(rxBuffer, sizeof(rxBuffer));
     if (state == RADIOLIB_ERR_NONE) {
-      // 🔓 Desencriptar AES-128
-      unsigned char dec[32];
-      mbedtls_aes_context aes;
-      mbedtls_aes_init(&aes);
-      mbedtls_aes_setkey_dec(&aes, aes_key, 128);
-      mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_DECRYPT, rxBuffer, dec);
-      mbedtls_aes_free(&aes);
 
-      String msg = (char*)dec;                 // Convertir a String
-      Serial.print("📦 Payload: "); Serial.println(msg);
-
-      // Parsear formato HELMO: "ID,val,raw,dist"
-      int c1 = msg.indexOf(',');               // Primera coma
-      int c2 = msg.indexOf(',', c1 + 1);       // Segunda coma
-      int c3 = msg.indexOf(',', c2 + 1);       // Tercera coma
+      // --- CAPA CRIPTOGRÁFICA: Descifrado AES-128 (Modo ECB) ---
+      unsigned char dec[32] = { 0 }; // Buffer para texto en claro
+      mbedtls_aes_context aes;       // Estructura de contexto del motor criptográfico
+      mbedtls_aes_init(&aes);        // Inicialización de hardware
+      mbedtls_aes_setkey_dec(&aes, aes_key, 128); // Carga de la llave maestra
       
-      if (c1 > 0 && c2 > c1 && c3 > c2) {
-        int id = msg.substring(0, c1).toInt(); // Sensor ID
-        float val = msg.substring(c1 + 1, c2).toFloat();     // Valor principal
-        float extra1 = msg.substring(c2 + 1, c3).toFloat();  // RAW o extra
-        float extra2 = msg.substring(c3 + 1).toFloat();      // Distancia si aplica
+      // Transformación: Texto Cifrado (rxBuffer) -> Texto Claro (dec)
+      mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_DECRYPT, (const unsigned char*)rxBuffer, dec);
+      mbedtls_aes_free(&aes);        // Liberación de memoria
 
-        // 📊 Procesar por sensor
-        if (id == 0) {                         // Nodo TURBIDEZ
-          turb_val = val;
-          turb_raw = extra1;
-          Serial.printf("🌊 Turb: %.1f NTU | RAW: %.0f\n", turb_val, turb_raw);
-          
-          // 🧠 ML automático + guardar MySQL
-          guardarSensor(id, val, extra1, 0, 0, 0);  // 0s para campos no aplicables
-          
-        } else if (id == 1) {                  // Nodo pH
-          ph_val = val;
-          Serial.printf("🧪 pH: %.2f\n", ph_val);
-          guardarSensor(id, val, 0, 0, 0, 0);
-          
-        } else if (id == 2) {                  // Nodo NIVEL
-          nivel_dist_cm = val;
-          nivel_altura_real = ALTURA_TANQUE_CM - nivel_dist_cm;
-          Serial.printf("📏 Dist: %.1fcm | Altura: %.1fcm\n", nivel_dist_cm, nivel_altura_real);
-          guardarSensor(id, nivel_altura_real, 0, nivel_dist_cm, nivel_altura_real, 0);
+      String msg = (char*)dec; // Conversión a String para fácil manipulación
+      Serial.print("📦 Payload Seguro (Desencriptado): ");
+      Serial.println(msg);
+
+      // --- PARSER DE PROTOCOLO: Extracción de CSV (Valores Separados por Comas) ---
+      // Busca la posición de cada coma en la cadena de texto
+      int c1 = msg.indexOf(',');
+      int c2 = msg.indexOf(',', c1 + 1);
+      int c3 = msg.indexOf(',', c2 + 1);
+      
+      // Validación básica de estructura de trama (Debe tener al menos una coma)
+      if (c1 > 0) { 
+        // Extracción y conversión de Sub-Strings a Tipos de Datos Primitivos
+        int id = msg.substring(0, c1).toInt();
+        float val = msg.substring(c1 + 1, c2).toFloat();
+        //float extra1 = (c2 > 0) ? msg.substring(c2 + 1, c3).toFloat() : 0;
+        //float extra2 = (c3 > 0) ? msg.substring(c3 + 1).toFloat() : 0;
+
+        // CORRECCIÓN: Manejo dinámico según la cantidad de comas en el CSV
+        float extra1 = 0;
+        float extra2 = 0;
+
+        if (c3 > 0) {
+          // Si hay 3 comas (ej. Turbidez)
+          extra1 = msg.substring(c2 + 1, c3).toFloat();
+          extra2 = msg.substring(c3 + 1).toFloat();
+        } else if (c2 > 0) {
+          // Si solo hay 2 comas (ej. Nivel o pH)
+          extra1 = msg.substring(c2 + 1).toFloat(); // Va hasta el final del String
         }
 
-        evaluarEstadoPTAP();                   // Recomendaciones operario
+        // --- ENRUTADOR (DEMULTIPLEXOR MULTI-AGENTE) ---
+        // Clasifica la información según la identidad del Agente Transmisor
+        if (id == 0) {  // Agente 0: Sensor Óptico de Turbidez
+          turb_ntu = val;
+          turb_raw = extra1;
+          turb_trend = extra2;
+          Serial.printf("Agente Turbidez -> NTU: %.1f\n", turb_ntu);
+          
+          actualizarML_Turbidez(turb_ntu); // Alimenta el modelo predictivo local
+          addHist(0, turb_ntu, turb_raw, dist_cm, altura_real, ph_val); // Guarda en RAM
+
+        } else if (id == 1) {  // Agente 1: Sensor Ultrasónico de Nivel ToF
+          dist_cm = val;
+          altura_real = extra1;
+          Serial.printf("Agente Nivel -> Altura: %.1fcm\n", altura_real);
+          
+          addHist(1, turb_ntu, turb_raw, dist_cm, altura_real, ph_val); // Guarda en RAM
+
+        } else if (id == 2) {  // Agente 2: Potenciómetro de Hidrógeno (pH)
+          ph_val = val;
+          ph_trend = extra1; 
+          Serial.printf("Agente pH -> Valor: %.2f | Tr: %.2f\n", ph_val, ph_trend);
+
+          addHist(2, turb_ntu, turb_raw, dist_cm, altura_real, ph_val); // Guarda en RAM
+        }
+
+        // --- ETAPA DE TOMA DE DECISIONES AUTÓNOMAS ---
+        controlarActuadores(); // Envía señales de pulso/PWM a motores y alarmas
+        evaluarEstado();       // Recalcula el nivel de riesgo de la planta
       }
     }
-    lora->startReceive();                      // Volver a modo RX
+    // Finalizada la transacción, ordena al chip LoRa volver a escuchar el espectro
+    lora->startReceive();
   }
 
-  actualizarOLED();                            // Refrescar pantalla
-  delay(100);                                  // Estabilidad loop
+  // 3. Actualización continua del Display Físico Local
+  actualizarOLED();
+  delay(10); // Pausa estratégica para evitar que el Watchdog Timer reinicie el procesador
 }
 
-// 🎛️ CONTROL LOOP ABIERTO - Recomendaciones para operario PTAP
-void evaluarEstadoPTAP() {
-  // 🧠 Usar predicción ML para alertas proactivas
-  bool turbOK = (turb_val <= TURB_MAX && turb_prediccion_ml < TURB_MAX * 1.2);
-  bool phOK = (ph_val >= PH_MIN && ph_val <= PH_MAX);
-  bool nivelOK = (nivel_altura_real >= NIVEL_MIN_CM);
+// ============ REGLAS DE NEGOCIO (SISTEMA REACTIVO) ============
+// Función que traduce datos crudos en acciones mecánicas de mitigación
+void controlarActuadores() {
+  // Regla Condicional 1: Derivación de agua por alta turbidez
+  // Si NTU > 500, abre la válvula a 90 grados; caso contrario, se mantiene en 0
+  servoTurbidez.write(turb_ntu > 500 ? 90 : 0);
+  
+  // Regla Condicional 2: Protección de bombas de succión por bajo nivel
+  digitalWrite(LED_NIVEL_BAJO, altura_real < 5.0 ? HIGH : LOW);
+  
+  // Regla Condicional 3: Alarma de pánico para operadores en sitio
+  bool alerta = (turb_ntu > 500 || altura_real < 5.0);
+  digitalWrite(BUZZER_ALERTA, alerta ? HIGH : LOW);
+}
 
-  if (turbOK && phOK && nivelOK) {
-    estadoGlobal = "🟢 OPTIMA";
-    accionRecomendada = "Continuar operación normal";
+// Función algorítmica lógica para clasificar la salud de la red hídrica
+void evaluarEstado() {
+  // Se evalúan booleanos con los límites permisibles de potabilidad básica
+  bool okTurb = turb_ntu <= 500;
+  bool okPh = ph_val >= 6.5 && ph_val <= 7.5;
+  bool okNivel = altura_real >= 5.0;
+
+  // Si todas las variables están en rango seguro
+  if (okTurb && okPh && okNivel) {
+    estadoGlobal = "OPTIMA";
+    accionRecomendada = "Mantener Operacion";
   } else {
-    estadoGlobal = "🔴 ALERTA";
-    if (!turbOK) {
-      accionRecomendada = "Filtrar agua - Predicción: " + String(turb_prediccion_ml,0) + "NTU";
-    } else if (!nivelOK) {
-      accionRecomendada = "Llenar tanque inmediatamente";
-    } else {
-      accionRecomendada = "Corregir pH químico";
-    }
+    // En caso de fallas, se priorizan las alertas según criticidad
+    estadoGlobal = "ALERTA CRITICA";
+    if (!okTurb) accionRecomendada = "Purgar Drenajes (Turbidez)";
+    else if (!okNivel) accionRecomendada = "Activar Llenado (Nivel)";
+    else accionRecomendada = "Corregir pH Químicamente";
   }
 }
 
-// 🔧 Control manual actuadores (operario PTAP vía web o inspección)
-void controlarActuadoresManual() {
-  // Solo alertas visuales/sonoras - NO actuadores automáticos
-  // Loop ABIERTO: operario PTAP decide acción final
-  digitalWrite(LED_NIVEL_BAJO, nivel_altura_real < NIVEL_MIN_CM ? HIGH : LOW);
-  
-  bool alerta_critica = (turb_val > TURB_MAX * 1.5 || nivel_altura_real < 2.0);
-  digitalWrite(BUZZER_ALERTA, alerta_critica ? HIGH : LOW);
-  
-  // Servo en posición NEUTRA - operario mueve manualmente
-  // servoTurbidez.write(45);  // ← COMENTADO: control manual PTAP
-}
-
-// 🖥️ Actualizar OLED con ML
+// ============ INTERFAZ LOCAL HARDWARE (OLED) ============
 void actualizarOLED() {
   pantalla.clear();
   pantalla.setFont(ArialMT_Plain_10);
-  pantalla.drawString(0, 0, "T:" + String(turb_val,0) + " P:" + String(ph_val,1));
-  pantalla.drawString(0, 12, "RAW:" + String(turb_raw,0) + " H:" + String(nivel_altura_real,1));
-  pantalla.drawString(0, 24, "Pred ML:" + String(turb_prediccion_ml,0));
-  pantalla.drawString(0, 36, estadoGlobal);
-  pantalla.drawString(0, 48, accionRecomendada.substring(0,21));  // Truncar
-  pantalla.display();
+  // Dibujado de cadenas alfanuméricas concatenadas para visión del operario
+  pantalla.drawString(0, 0, "T:" + String(turb_ntu, 0) + " RAW:" + String(turb_raw, 0));
+  pantalla.drawString(0, 12, "pH:" + String(ph_val, 2));
+  pantalla.drawString(0, 24, "H:" + String(altura_real, 1) + " D:" + String(dist_cm, 1));
+  pantalla.drawString(0, 36, "ESTADO: " + estadoGlobal);
+  pantalla.drawString(0, 48, accionRecomendada);
+  pantalla.display(); // Refresca la matriz de píxeles
 }
 
-// 🌐 WEB COMPLETA PTAP con ML (loop abierto)
-void webCompletaPTAP() {
-  // 🔐 Autenticación obligatoria operario
-  if (!server.authenticate(WEB_USER, WEB_PASS)) {
-    return server.requestAuthentication();
+// ============ INTERFAZ DIGITAL HMI (SERVIDOR WEB) ============
+// Renderiza el HTML, CSS inyectado y datos en tiempo real de forma dinámica
+void webCompleta() {
+  String html = "<!DOCTYPE html><html><head>";
+  // Auto-refresco de la página cada 3 segundos (Comportamiento de Dashboard)
+  html += "<meta charset='UTF-8'><meta http-equiv='refresh' content='3'>";
+  html += "<title>PTAP Central</title>";
+  
+  // Estilos CSS (Modo Oscuro moderno según el diseño aprobado)
+  html += "<style>";
+  html += "body{font-family:Arial;text-align:center;background:#1e293b;color:white;margin:0;padding:10px}";
+  html += ".card{display:inline-block;width:280px;margin:10px;padding:12px;background:#0f172a;border-radius:12px;box-shadow: 0 4px 6px rgba(0,0,0,0.3);}";
+  html += "#hist{max-height:260px;overflow-y:auto;margin:10px auto;width:95%; border-radius: 8px;}";
+  html += "table{width:100%;border-collapse:collapse;font-size:12px;background:#0f172a;}";
+  html += "th,td{border-bottom:1px solid #334155;padding:8px}";
+  html += "th{position:sticky;top:0;background:#020617; color:#38bdf8;}";
+  html += "</style></head><body><h1>Central PTAP (Monitoreo HELMO)</h1>";
+
+  // Inyección dinámica de variables globales en el HTML (Cajas de Mando)
+  html += "<div class='card'><h3>🌊 Turbidez</h3>";
+  html += "NTU: <b>" + String(turb_ntu, 1) + "</b><br>";
+  html += "RAW: <span style='color:gray;'>" + String(turb_raw, 0) + "</span></div>";
+
+  html += "<div class='card'><h3>🧪 pH</h3>";
+  html += "<b style='font-size:24px;'>" + String(ph_val, 2) + "</b></div>";
+
+  html += "<div class='card'><h3>📏 Nivel</h3>";
+  html += "Altura: <b>" + String(altura_real, 1) + " cm</b><br>";
+  html += "<span style='color:gray;'>Distancia Sensor: " + String(dist_cm, 1) + " cm</span></div>";
+
+  // Bloque de estado general del sistema (Output de la lógica condicional)
+  html += "<h2 style='color:" + String(estadoGlobal == "OPTIMA" ? "#4ade80" : "#f87171") + ";'>" + estadoGlobal + "</h2>";
+  html += "<p style='font-size:18px;'>" + accionRecomendada + "</p>";
+
+  // Estado de los actuadores físicos
+  html += "<p style='color:#94a3b8;'>Estatus Hardware -> Servo: " + String(servoTurbidez.read()) + "° | LED Alarma: ";
+  html += digitalRead(LED_NIVEL_BAJO) ? "<span style='color:red;'>ON</span>" : "OFF";
+  html += "</p>";
+
+  // Generación dinámica de la tabla consultando la memoria RAM (Structs)
+  html += "<h3>Últimos paquetes procesados en red LoRa</h3>";
+  html += "<div id='hist'><table>";
+  html += "<tr><th>Iteración</th><th>Agente Origen</th><th>NTU</th><th>RAW</th><th>Alt(cm)</th><th>Dist(cm)</th><th>pH</th></tr>";
+
+  // Bucle de renderizado inverso para mostrar el dato más nuevo en la parte superior
+  int printed = 0;
+  for (int i = 0; i < hist_count; i++) {
+    int idx = (hist_idx - 1 - i + HIST_MAX) % HIST_MAX; // Navegación de la cola circular
+    const Registro& r = hist[idx];
+
+    html += "<tr>";
+    html += "<td>#" + String(hist_count - i) + "</td>"; // Conteo progresivo inverso
+    
+    // Traducción legible del ID numérico del Agente
+    if (r.sensor_id == 0) html += "<td style='color:#38bdf8;'>Turbidez</td>";
+    else if (r.sensor_id == 1) html += "<td style='color:#a78bfa;'>Nivel</td>";
+    else if (r.sensor_id == 2) html += "<td style='color:#4ade80;'>pH</td>";
+    else html += "<td>Desconocido</td>";
+
+    // Vaciado de celdas de datos con precisión controlada
+    html += "<td>" + String(r.turb_ntu_, 1) + "</td>";
+    html += "<td>" + String(r.turb_raw_, 0) + "</td>";
+    html += "<td>" + String(r.altura_, 1) + "</td>";
+    html += "<td>" + String(r.dist_cm_, 1) + "</td>";
+    html += "<td>" + String(r.ph_, 2) + "</td>";
+    html += "</tr>";
+
+    printed++;
+    if (printed >= 40) break; // Límite de seguridad visual
   }
 
-  String html = "<!DOCTYPE html><html><head>";
-  html += "<meta charset='UTF-8'><meta http-equiv='refresh' content='3'>";
-  html += "<title>🟢 PTAP HELMO Central ML</title>";
-  html += "<style>body{font-family:Arial;background:linear-gradient(135deg,#667eea,#764ba2);";
-  html += "color:white;text-align:center;padding:20px}.card{display:inline-block;width:320px;";
-  html += "margin:10px;padding:20px;background:rgba(255,255,255,0.9);border-radius:15px;";
-  html += "box-shadow:0 10px 30px rgba(0,0,0,0.3)}.valor{font-size:2.2em;font-weight:bold}";
-  html += ".rojo{color:#d32f2f}.verde{color:#388e3c}.pred{color:#ff9800}</style>";
-  html += "</head><body><h1 style='font-size:3em'>🔐 PTAP HELMO <span style='color:#00ff88'>Central</span></h1>";
+  html += "</table></div>";
+  html += "</body></html>";
 
-  // 🌊 Card TURBIDEZ + ML
-  html += "<div class='card'><h3>🌊 Turbidez</h3>";
-  html += "<div class='valor'>" + String(turb_val,1) + " NTU</div>";
-  html += "<div>RAW: <b>" + String(turb_raw,0) + "</b></div>";
-  html += "<div class='pred'>🤖 Predicción: <b>" + String(turb_prediccion_ml,0) + "</b> NTU</div>";
-  html += turb_val <= TURB_MAX ? "<div class='verde'>✅ NORMAL</div>" : "<div class='rojo'>❌ FILTRAR</div>";
-  html += "</div>";
+  // Despacho del protocolo HTTP Code 200 OK con el HTML empaquetado
+  server.send(200, "text/html", html);
+}
 
-  // 🧪 Card pH
-  html += "<div class='card'><h3>🧪 pH</h3>";
-  html += "<div class='valor'>" + String(ph_val,2) + "</div>";
-  html += ph_val >= PH_MIN && ph_val <= PH_MAX ? "<div class='verde'>✅ POTABLE</div>" : "<div class='rojo'>❌ CORREGIR</div>";
-  html += "</div>";
+// ============ ALGORITMOS DE EDGE COMPUTING (Ventana Móvil) ============
+// Incorpora un nuevo dato al array histórico para el modelo de ML local
+void actualizarML_Turbidez(float nueva_lectura) {
+  turb_ventana[turb_idx] = nueva_lectura;
+  turb_idx = (turb_idx + 1) % ML_VENTANA_TURB;
+}
 
-  // 📏 Card NIVEL
-  html += "<div class='card'><h3>📏 Nivel Tanque</h3>";
-  html += "<div class='valor'>" + String(nivel_altura_real,1) + " cm</div>";
-  html += "<div>Sensor: " + String(nivel_dist_cm,1) + " cm</div>";
-  html += "</div>";
+// Lógica de predicción rudimentaria basada en tasas de cambio
+float calcularPrediccion() {
+  float suma = 0;
+  int validas = 0;
+  
+  // Limpieza de nulos
+  for (int i = 0; i < ML_VENTANA_TURB; i++) {
+    if (turb_ventana[i] > 0) {
+      suma += turb_ventana[i];
+      validas++;
+    }
+  }
+  if (validas == 0) return turb_ntu; // Si no hay data suficiente, retorna el valor actual
 
-  // 🎛️ Estado global + recomendación operario
-  html += "<div class='card' style='width:100%;background:rgba(0,255,0,0.2)'>";
-  html += "<h2>" + estadoGlobal + "</h2>";
-  html += "<p style='font-size:1.3em'>" + accionRecomendada + "</p>";
-  html += "<small>🗄️ MySQL: " + String(mysql_conectado ? "✅ ONLINE" : "❌ OFFLINE") + "</small>";
-  html += "</div>";
+  // Cálculo del promedio histórico
+  float prom = suma / validas;
+  
+  // Cálculo diferencial entre el instante actual (idx) y 5 ventanas atrás
+  int idx_pasado = (turb_idx - 5 + ML_VENTANA_TURB) % ML_VENTANA_TURB;
+  float tendencia = (turb_ventana[turb_idx] - turb_ventana[idx_pasado]) / 5.0;
 
-  html += "<div style='margin-top:30px;font-size:1.2em'>";
-  html += "Control LOOP ABIERTO | Operario PTAP autorizado";
-  html += "</div></body></html>";
-
-  server.send(200, "text/html", html);         // Enviar página responsive
+  // Extrapolación lineal hacia el futuro
+  return prom + tendencia * ML_HORAS_ADELANTE;
 }
