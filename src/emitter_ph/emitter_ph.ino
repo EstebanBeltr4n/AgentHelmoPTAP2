@@ -1,20 +1,31 @@
-// ===== Emisor PH (ID = 1) =====
-#define NODE_ID 1
-#define NODE_TYPE "PH"
+/* ============================================================================
+ PROYECTO: SISTEMA MULTI-AGENTE DE MONITOREO HÍDRICO HELMO (PTAP)
+ NODO: AGENTE EMISOR DE PH (ID: 2)
+ ============================================================================
+ Autor: Esteban Eduardo Escarraga 
+ Propósito: Captura pH, Cifrado AES-128, LoRa 915MHz, Deep Sleep
+ Hardware: Heltec LoRa32 V3 + PH-4502C
+ Fecha: 31 de marzo de 2026
+ DESCRIPTOR: Medición electroquímica de pH con filtrado EMA y cifrado simétrico.
+ ============================================================================*/
 
 #include <RadioLib.h>
 #include <Wire.h>
 #include "HT_SSD1306Wire.h"
-#include "mbedtls/aes.h"
+#include <mbedtls/aes.h>
+#include <esp_sleep.h>
+#include <SPI.h>
 
-const unsigned char aes_key[16] = {
-  'E','s','t','e','b','a','n','L','o','R','a','2','0','2','6','!'
-};
+// ------------------- CONFIGURACIÓN HARDWARE V3 -------------------
+#define NODE_ID 2
+#define PACKET_SIZE 10
+#define PH_PIN 2
 
+// Pines específicos Heltec LoRa32 V3
 #define SDA_OLED 17
 #define SCL_OLED 18
 #define RST_OLED 21
-#define VEXT_PIN 36
+#define VEXT_PIN 36 // Control de energía (Pantalla/Sensores)
 
 #define LORA_CS   8
 #define LORA_SCK  9
@@ -24,96 +35,137 @@ const unsigned char aes_key[16] = {
 #define LORA_BUSY 13
 #define LORA_DIO1 14
 
-// PH-4502C: salida analógica PO -> pin ADC
-#define SENSOR_PH_PIN 2
+// ------------------- OBJETOS Y VARIABLES -------------------
+SSD1306Wire oled(0x3c, 500000, SDA_OLED, SCL_OLED, GEOMETRY_128_64, RST_OLED);
 
-SSD1306Wire pantalla(0x3c, 500000, SDA_OLED, SCL_OLED,
-                     GEOMETRY_128_64, RST_OLED);
+// Corrección para la instanciación segura de RadioLib (Punteros)
 SX1262* lora;
 
+float buffer_ph[PACKET_SIZE];
+int buffer_idx = 0;
 float ema = 7.0;
-float tendencia = 0.0;
-float hist[10];
-int idxHist = 0;
-int nHist = 0;
 
-void setup() {
-  Serial.begin(115200);
-  delay(1000);
+// Clave AES (16 bytes) - Debe coincidir exactamente con el Central
+const unsigned char aes_key[16] = {'E','s','t','e','b','a','n','L','o','R','a','2','0','2','6','!'};
 
+// ------------------- FUNCIONES DE APOYO -------------------
+
+void initDisplay() {
   pinMode(VEXT_PIN, OUTPUT);
-  digitalWrite(VEXT_PIN, LOW);
+  digitalWrite(VEXT_PIN, LOW); // LOW activa la energía en la Heltec V3
   delay(100);
+  oled.init();
+  oled.flipScreenVertically();
+  oled.setFont(ArialMT_Plain_10);
+}
 
-  pantalla.init();
-  pantalla.clear();
-  pantalla.setFont(ArialMT_Plain_10);
-  pantalla.drawString(0, 0, "Nodo PH ID 1");
-  pantalla.display();
-
+void initLoRa() {
+  Serial.print(F("[LoRa] Iniciando... "));
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
+  
   Module* radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY, SPI);
   lora = new SX1262(radio);
 
-  // ✅ BIEN (todos usan 0x12)
+  // CORRECCIÓN VITAL: Sincronización de parámetros con la red HELMO
+  // Frecuencia: 915MHz, BW: 125kHz, SF: 7, CR: 5, SyncWord: 0x12 (Privada), Pwr: 22dBm
   int state = lora->begin(915.0, 125.0, 7, 5, 0x12, 22, 8, 1.6);
-  
-  if (state == RADIOLIB_ERR_NONE) {
-    Serial.println("LoRa PH OK");
-  } else {
-    Serial.print("LoRa error: "); Serial.println(state);
-  }
 
-  pinMode(SENSOR_PH_PIN, INPUT);
+  if (state == RADIOLIB_ERR_NONE) {
+    if (lora->setDio2AsRfSwitch(true) != RADIOLIB_ERR_NONE) {
+      Serial.println(F("Error en RF Switch"));
+    }
+    Serial.println(F("¡Éxito!"));
+  } else {
+    Serial.print(F("Fallo, código: "));
+    Serial.println(state);
+    while (true);
+  }
+}
+
+float readPH() {
+  long sum = 0;
+  for(int i = 0; i < 20; i++) {
+    sum += analogRead(PH_PIN);
+    delay(10);
+  }
+  float voltage = (sum / 20.0) * (3.3 / 4095.0);
+  // Ecuación de calibración (ajustar según pruebas reales con soluciones buffer)
+  return (-5.70 * voltage) + 21.34; 
+}
+
+void printDisplay(float ph) {
+  oled.clear();
+  oled.setFont(ArialMT_Plain_10);
+  oled.drawString(0, 0, "MONITOREO AGUA V2.1");
+  oled.drawHorizontalLine(0, 12, 128);
+  
+  oled.setFont(ArialMT_Plain_16);
+  oled.drawString(0, 20, "pH: " + String(ph, 2));
+  
+  oled.setFont(ArialMT_Plain_10);
+  oled.drawString(0, 45, "Buffer: " + String(buffer_idx + 1) + "/" + String(PACKET_SIZE));
+  oled.display();
+}
+
+// ------------------- SETUP & LOOP -------------------
+
+void setup() {
+  Serial.begin(115200);
+  initDisplay();
+  initLoRa();
+  
+  oled.clear();
+  oled.drawString(0, 0, "Sistema Listo");
+  oled.display();
+  delay(2000);
 }
 
 void loop() {
-  int raw = analogRead(SENSOR_PH_PIN);
-  float volt = raw * 3.3 / 4095.0;
+  float ph_raw = readPH();
+  ema = 0.3 * ph_raw + 0.7 * ema;
+  
+  printDisplay(ph_raw);
+  
+  buffer_ph[buffer_idx] = ph_raw;
+  buffer_idx++;
 
-  // Aproximación, deberás calibrar
-  float ph = 7.0 + ((2.5 - volt) / 0.18);
+  Serial.printf("pH: %.2f | EMA: %.2f | Buffer: %d/%d\n", ph_raw, ema, buffer_idx, PACKET_SIZE);
 
-  float val = ph;
-  ema = 0.3 * val + 0.7 * ema;
+  if (buffer_idx >= PACKET_SIZE) {
+    Serial.println("Buffer lleno. Iniciando protocolo de transmisión...");
+    
+    // --- NUEVA LÓGICA DE TRANSMISIÓN IMPLEMENTADA ---
+    
+    char txPacket[16]; // Buffer exacto para AES-128
+    memset(txPacket, 0, 16); 
+    
+    // Formateo CSV: ID, pH_actual, Tendencia_EMA
+    snprintf(txPacket, sizeof(txPacket), "%d,%.2f,%.2f", NODE_ID, ph_raw, ema);
+    Serial.print("TX pH (Plano): "); Serial.println(txPacket);
 
-  hist[idxHist] = val;
-  idxHist = (idxHist + 1) % 10;
-  if (nHist < 10) nHist++;
+    // Cifrado AES-128 ECB
+    unsigned char enc[16];
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_enc(&aes, aes_key, 128);
+    mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, (const unsigned char*)txPacket, enc);
+    mbedtls_aes_free(&aes);
 
-  if (nHist >= 3) {
-    float v0 = hist[(idxHist + 9) % 10];
-    float v1 = hist[(idxHist + 8) % 10];
-    float v2 = hist[(idxHist + 7) % 10];
-    float avg = (v0 + v1 + v2) / 3.0;
-    tendencia = avg - ema;
+    // Transmisión LoRa
+    int txState = lora->transmit(enc, 16);
+    
+    if (txState == RADIOLIB_ERR_NONE) {
+      Serial.println("TX Estado: OK (Paquete entregado a la red)");
+    } else {
+      Serial.printf("TX Estado error: %d\n", txState);
+    }
+
+    buffer_idx = 0; 
+    
+    
+    
+    delay(5000); 
+  } else {
+    delay(5000); // Muestreo cada 5 segundos
   }
-
-  String payload = String(NODE_ID) + "," +
-                   String(val, 2) + "," +
-                   String(tendencia, 3);
-
-  unsigned char plain[16] = {0};
-  payload.getBytes(plain, 16);
-
-  unsigned char enc[16];
-  mbedtls_aes_context aes;
-  mbedtls_aes_init(&aes);
-  mbedtls_aes_setkey_enc(&aes, aes_key, 128);
-  mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, plain, enc);
-  mbedtls_aes_free(&aes);
-
-  int txState = lora->transmit(enc, 16);
-  Serial.print("TX PH: "); Serial.println(payload);
-  Serial.print("TX Estado: "); Serial.println(txState);
-
-  pantalla.clear();
-  pantalla.setFont(ArialMT_Plain_10);
-  pantalla.drawString(0, 0, "pH:" + String(ph, 2) +
-                           " V:" + String(volt, 2));
-  pantalla.drawString(0, 14, "EMA:" + String(ema, 2));
-  pantalla.drawString(0, 28, "Trend:" + String(tendencia, 3));
-  pantalla.display();
-
-  delay(4000);
 }

@@ -1,173 +1,159 @@
-// ===== Emisor TURBIDEZ (ID = 0) =====
-// 18 de marco de 2026
-/*
-Agente EMisor sensor de turbidez  HELMO PTAP SMART fincional calibrado por 
-salida analogica
-*/
-#define NODE_ID 0
-#define NODE_TYPE "TURB"
+/* =============================================================
+   PROYECTO: SISTEMA MULTI-AGENTE DE MONITOREO HÍDRICO HELMO (PTAP)
+   NODO: AGENTE EMISOR DE TURBIDEZ (ID: 0)
+   =============================================================
+   Autor: Esteban Eduardo Escarraga
+   Propósito:
+   Hardware:
+   FECHA: 31 de marzo de 2026
+   DESCRIPTOR: Clasificación de calidad mediante análisis óptico
+   ============================================================= */
 
-#include <RadioLib.h>
-#include <Wire.h>
-#include "HT_SSD1306Wire.h"
-#include "mbedtls/aes.h"
+#define NODE_ID 0           // Identificador único para el Nodo Central
+#define NODE_TYPE "TURB"    // Etiqueta del tipo de sensor para depuración
 
-// Clave AES 128 bits
+#include <RadioLib.h>       // Protocolo de comunicación física LoRa
+#include <Wire.h>           // Protocolo I2C para periféricos
+#include "HT_SSD1306Wire.h" // Driver para pantalla OLED (Heltec V3)
+#include "mbedtls/aes.h"    // Motor de cifrado avanzado (Hardware Acceleration)
+
+// --- CAPA DE SEGURIDAD: LLAVE AES-128 ---
+// Debe ser idéntica en el Nodo Central para permitir la desincronización
 const unsigned char aes_key[16] = {
-  'E', 's', 't', 'e', 'b', 'a', 'n', 'L', 'o', 'R', 'a', '2', '0', '2', '6', '!'
+  'E','s','t','e','b','a','n','L','o','R','a','2','0','2','6','!'
 };
 
-// Pines Heltec V3
+// --- MAPEO DE HARDWARE (HELTEC ESP32-S3 V3) ---
 #define SDA_OLED 17
 #define SCL_OLED 18
 #define RST_OLED 21
-#define VEXT_PIN 36
+#define VEXT_PIN 36 // Control de alimentación para periféricos externos
 
-#define LORA_CS 8
-#define LORA_SCK 9
+#define LORA_CS    8
+#define LORA_SCK   9
 #define LORA_MOSI 10
 #define LORA_MISO 11
-#define LORA_RST 12
+#define LORA_RST   12
 #define LORA_BUSY 13
 #define LORA_DIO1 14
 
+// --- CONFIGURACIÓN DEL SENSOR DE TURBIDEZ ---
+#define TURB_AO 1             // Pin de entrada analógica (ADC)
+const float VOLT_REF = 3.3;   // Voltaje de referencia del ESP32-S3
+const int   ADC_MAX  = 4095;  // Resolución de 12 bits para mayor precisión
 
-#define SENSOR_TURBIDEZ_PIN 1  // Sensor turbidez (salida ANALÓGICA AO del módulo)
+// --- PARÁMETROS DE CLASIFICACIÓN (UMBRALES) ---
+// Valor crítico obtenido mediante pruebas de laboratorio para agua no tratada
+int RAW_UMBRAL_TURBIO = 500;  
 
-// Opcional: salida DIGITAL DO si quieres solo umbral}
-//#define SENSOR_TURBIDEZ_DO  3
-
-SSD1306Wire pantalla(0x3c, 500000, SDA_OLED, SCL_OLED,
-                     GEOMETRY_128_64, RST_OLED);
+// Inicialización de objetos de hardware
+SSD1306Wire pantalla(0x3c, 500000, SDA_OLED, SCL_OLED, GEOMETRY_128_64, RST_OLED);
 SX1262* lora;
 
-// Modelo local
-float ema = 0.0;
-float tendencia = 0.0;
-float hist[10];
-int idxHist = 0;
-int nHist = 0;
-
-// === Valores de calibración (AJUSTA ESTO) ===
-// Lee el valor RAW en Serial con agua muy limpia y muy turbia
-const int RAW_LIMPIO = 1000;  //4000 casi sin turbidez
-const int RAW_SUCIO = 800;    //800 agua muy turbia
+// Variable para el Filtro de Media Exponencial (EMA)
+// Permite suavizar el ruido eléctrico del sensor analógico
+float ema_ntu = 0.0;
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
+  Serial.println("=== EMISOR TURBIDEZ ID 0 ===");
 
+  // Activación del bus de energía Vext para encender la pantalla OLED
   pinMode(VEXT_PIN, OUTPUT);
-  digitalWrite(VEXT_PIN, LOW);
+  digitalWrite(VEXT_PIN, LOW); 
   delay(100);
 
   pantalla.init();
   pantalla.clear();
   pantalla.setFont(ArialMT_Plain_10);
-  pantalla.drawString(0, 0, "Nodo TURB ID 0");
+  pantalla.drawString(0, 0, "Emisor TURB ID 0");
   pantalla.display();
 
-  // LoRa
+  pinMode(TURB_AO, INPUT); // Configuración del puerto del sensor
+
+  // --- CONFIGURACIÓN DEL TRANSCEPTOR LORA ---
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
   Module* radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY, SPI);
   lora = new SX1262(radio);
 
- 
-  // ✅ BIEN (todos usan 0x12)
+  // Frecuencia 915MHz, Ancho de banda 125kHz, Spreading Factor 7
   int state = lora->begin(915.0, 125.0, 7, 5, 0x12, 22, 8, 1.6);
   if (state == RADIOLIB_ERR_NONE) {
     Serial.println("LoRa TURB OK");
   } else {
-    Serial.print("LoRa error: ");
-    Serial.println(state);
+    Serial.print("LoRa error: "); Serial.println(state);
+    while (1); // Bloqueo de seguridad si falla la RF
   }
+}
 
-  pinMode(SENSOR_TURBIDEZ_PIN, INPUT);  //PARA SALIDA ANALOGICA
-  //pinMode(SENSOR_TURBIDEZ_DO, INPUT);  // si quieres usar la salida digital
+// Función Matemática: Mapeo de precisión para datos tipo float
+float mapFloat(float x, float in_min, float in_max, float out_min, float out_max) {
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
 
 void loop() {
-  // 1) Medición analógica
-  int raw = analogRead(SENSOR_TURBIDEZ_PIN);
-  float volt = raw * 3.3 / 4095.0;
+  // 1) Adquisición de Datos: Lectura de la señal analógica del fototransistor
+  int raw = analogRead(TURB_AO);
+  float volt = (raw * VOLT_REF) / ADC_MAX;
 
-  // NTU relativo (0–1000) usando los valores calibrados
-  int ntu = map(raw, RAW_LIMPIO, RAW_SUCIO, 0, 1000);
-  ntu = constrain(ntu, 0, 1000);
+  // 2) Procesamiento: Conversión a Unidades de Turbidez Nefelométrica (NTU)
+  // Nota: Se asume una relación lineal aproximada para fines académicos
+  float ntu = mapFloat(volt, 0.0, VOLT_REF, 0.0, 1000.0);
+  if (ntu < 0) ntu = 0;
+  if (ntu > 1000) ntu = 1000;
 
-  // Porcentaje de turbidez (0% limpia – 100% muy turbia)
-  float turbPorc = (ntu / 1000.0) * 100.0;
+  // 3) Análisis de Tendencia (Edge Computing):
+  // Se aplica EMA (Exponential Moving Average) con factor de 0.3 para detectar cambios bruscos
+  ema_ntu = 0.3 * ntu + 0.7 * ema_ntu;
+  float tendencia = ntu - ema_ntu; // Diferencial de cambio
 
-  // Clasificación cualitativa
+  // 4) Lógica de Clasificación Binaria
   String estadoAgua;
-  if (turbPorc < 30) estadoAgua = "AGUA LIMPIA";
-  else if (turbPorc < 70) estadoAgua = "TURBIDEZ MEDIA";
-  else estadoAgua = "TURBIDEZ ALTA";
-
-  // 2) Modelo local EMA + tendencia sobre NTU
-  float val = ntu;
-  ema = 0.3 * val + 0.7 * ema;
-  hist[idxHist] = val;
-  idxHist = (idxHist + 1) % 10;
-  if (nHist < 10) nHist++;
-
-  if (nHist >= 3) {
-    float v0 = hist[(idxHist + 9) % 10];
-    float v1 = hist[(idxHist + 8) % 10];
-    float v2 = hist[(idxHist + 7) % 10];
-    float avg = (v0 + v1 + v2) / 3.0;
-    tendencia = avg - ema;
+  if (raw >= RAW_UMBRAL_TURBIO) {
+    estadoAgua = "TURBIA";
+  } else {
+    estadoAgua = "LIMPIA";
   }
 
-  // 3) Empaquetar: "ID,valor,tendencia" (usa NTU)
-  String payload = String(NODE_ID) + "," + String(val, 1) + "," + String(tendencia, 2);
+  // 5) Construcción del Payload (Protocolo CSV Optimizado)
+  // Formato: ID_NODO,VALOR_NTU,VALOR_RAW,VALOR_TENDENCIA
+  String payload = String(NODE_ID) + "," +
+                   String(ntu, 1) + "," +
+                   String(raw) + "," +
+                   String(tendencia, 2);
 
-  unsigned char plain[16] = { 0 };
-  payload.getBytes(plain, 16);
+  // 6) CAPA CRIPTOGRÁFICA (AES-128)
+  // Preparación del bloque de texto plano de 32 bytes
+  unsigned char plain[32] = {0};
+  payload.toCharArray((char*)plain, 32);
 
-  unsigned char enc[16];
+  unsigned char enc[32]; // Buffer para la trama cifrada
   mbedtls_aes_context aes;
   mbedtls_aes_init(&aes);
-  mbedtls_aes_setkey_enc(&aes, aes_key, 128);
-  mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, plain, enc);
+  mbedtls_aes_setkey_enc(&aes, aes_key, 128); // Carga de llave simétrica
+  mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, plain, enc); // Cifrado ECB
   mbedtls_aes_free(&aes);
 
-  int txState = lora->transmit(enc, 16);
+  // Transmisión de largo alcance (LoRa)
+  int txState = lora->transmit(enc, 32);
 
-  // 4) Serial – información completa
-  Serial.println("----------- TURBIDEZ -----------");
-  Serial.print("RAW: ");
-  Serial.println(raw);
-  Serial.print("Volt: ");
-  Serial.println(volt, 3);
-  Serial.print("NTU aprox: ");
-  Serial.println(ntu);
-  Serial.print("Turbidez %: ");
-  Serial.print(turbPorc, 1);
-  Serial.println("%");
-  Serial.print("Estado: ");
-  Serial.println(estadoAgua);
-  Serial.print("EMA: ");
-  Serial.println(ema, 1);
-  Serial.print("Tendencia: ");
-  Serial.println(tendencia, 2);
-  Serial.print("TX payload: ");
-  Serial.println(payload);
-  Serial.print("TX estado LoRa: ");
-  Serial.println(txState);
+  // 7) Telemetría vía Puerto Serial (Debug)
+  Serial.println("---- TURBIDEZ TX ----");
+  Serial.print("RAW: ");   Serial.println(raw);
+  Serial.print("Estado: ");Serial.println(estadoAgua);
+  Serial.print("Payload: "); Serial.println(payload);
+  Serial.print("TX estado: "); Serial.println(txState);
 
-  // 5) OLED – porcentaje + estado
+  // 8) HMI Local: Actualización de la interfaz OLED
   pantalla.clear();
   pantalla.setFont(ArialMT_Plain_10);
-  pantalla.drawString(0, 0,
-                      "RAW:" + String(raw) + " V:" + String(volt, 2));
-  pantalla.drawString(0, 14,
-                      "NTU:" + String(ntu) + " (" + String(turbPorc, 0) + "%)");
-  pantalla.drawString(0, 28,
-                      estadoAgua);  // LIMPIA / MEDIA / ALTA
-  pantalla.drawString(0, 42,
-                      "EMA:" + String(ema, 1) + " Tr:" + String(tendencia, 2));
+  pantalla.drawString(0, 0, "RAW:" + String(raw));
+  pantalla.drawString(0, 12, "NTU:" + String(ntu,1));
+  pantalla.drawString(0, 24, "Est:" + estadoAgua);
+  pantalla.drawString(0, 36, "Tr:" + String(tendencia,2));
   pantalla.display();
 
-  delay(4000);
+  // Ciclo de muestreo: 2000ms (Frecuencia de 0.5 Hz)
+  delay(2000); 
 }
