@@ -1,24 +1,57 @@
-# Análisis del Firmware: Agente Emisor de pH (ID: 2)
+## 1. Descripción General
+El Agente Emisor de pH (Nodo ID: 2) es un componente de borde (Edge) encargado exclusivamente de adquirir, procesar y transmitir el nivel de acidez/alcalinidad del agua. Utiliza un sensor analógico **PH-4502C** y aplica procesamiento local mediante un filtro de Media Móvil Exponencial (EMA) para suavizar las lecturas. 
 
-Este firmware se encarga de la caracterización electroquímica del agua y destaca por su mecanismo de búfer de datos para optimizar el uso de la red LoRa.
+Para optimizar el uso del espectro y la energía, el nodo implementa un sistema de almacenamiento local (Buffer) que agrupa 10 lecturas antes de empaquetarlas, cifrarlas con **AES-128 ECB** y transmitirlas al nodo central vía **LoRa**.
 
-## 1. Caracterización Electroquímica
-El sensor PH-4502C emite una variación de voltaje basada en la concentración de iones de hidrógeno. El código promedia 20 muestras rápidas de ADC, calcula el voltaje real considerando el ADC de 12 bits y el voltaje de referencia (3.3V), y aplica la ecuación de la recta de calibración:
+## 2. Especificaciones de Hardware
+* **Microcontrolador:** Heltec WiFi LoRa 32 V3 (ESP32-S3 + SX1262)
+* **Sensor:** Módulo de pH PH-4502C con sonda BNC.
+* **Pantalla:** OLED SSD1306 de 0.96" integrada (Control vía bus VEXT).
+* **Frecuencia LoRa:** 915.0 MHz (Banda ISM).
 
-$$pH = -5.70 \cdot V + 21.34$$
+## 3. Asignación de Pines (Pinout)
+| Componente | Pin Heltec V3 | Función |
+| :--- | :--- | :--- |
+| **PH-4502C** | `GPIO 2` | Entrada Analógica (ADC_11db, 12-bit) |
+| **OLED SDA** | `GPIO 17` | Datos I2C |
+| **OLED SCL** | `GPIO 18` | Reloj I2C |
+| **VEXT_PIN** | `GPIO 36` | Alimentación de periféricos (Activo en LOW) |
+| **LoRa SPI** | `8, 9, 10, 11` | CS, SCK, MOSI, MISO |
+| **LoRa Control** | `12, 13, 14` | RST, BUSY, DIO1 |
 
-## 2. Filtro Promedio Móvil Exponencial (EMA)
-Para contrarrestar el ruido térmico y las fluctuaciones del electrodo, se aplica un filtro recursivo IIR:
+## 4. Calibración y Modelado Matemático
+El sistema utiliza una ecuación lineal de primer orden para convertir el voltaje medido en la escala de pH. Los parámetros base definidos en el código (ajustables empíricamente con soluciones buffer) son:
 
-$$EMA_{t} = 0.3 \cdot pH_{actual} + 0.7 \cdot EMA_{t-1}$$
+* **Punto de Neutralidad ($pH = 7.0$):** 2.50 V
+* **Pendiente de conversión ($m$):** 0.18 V/pH
 
-Esto genera un vector de tendencia suave que refleja la calidad real del agua a lo largo del tiempo.
+La ecuación de calibración implementada en el firmware es:
+$$pH = 7.0 + \left( \frac{2.50 - V_{sensor}}{0.18} \right)$$
 
-## 3. Mecanismo de Buffer y Transmisión
-A diferencia de otros nodos que transmiten inmediatamente, el Agente de pH almacena localmente las lecturas en un arreglo `buffer_ph` hasta alcanzar el `PACKET_SIZE` (10 muestras). Una vez lleno, ensambla el payload `2,pH_actual,EMA`, cifra el bloque de 16 bytes con AES-128 y lo inyecta a la red LoRa, ahorrando energía (Duty Cycle) al no saturar el espectro.
+## 5. Lógica de Adquisición y Transmisión
+1. **Sobremuestreo (Oversampling):** Se toman 20 muestras analógicas consecutivas (separadas por 10ms) para calcular un promedio y mitigar el ruido eléctrico del ADC.
+2. **Filtrado EMA:** Se aplica un filtro de media exponencial (Factor $\alpha = 0.30$) para rastrear la tendencia, evitando falsos positivos por picos transitorios.
+3. **Buffering:** Los valores se almacenan en un arreglo local. Al alcanzar `PACKET_SIZE = 10`, se dispara el evento de transmisión.
+4. **Criptografía:** El payload (formato `ID,pH,EMA`) se cifra utilizando la librería `mbedtls` bajo el estándar simétrico AES-128.
+5. **Telemetría RF:** Se transmite un paquete fijo de 16 bytes a través del transceptor SX1262 utilizando Spreading Factor 7 y Ancho de Banda de 125 kHz.
 
+---
 
-## Normativa RAS 2000 Colombia
-- **Potable**: 6.5-8.5 pH
-- **Tratamiento**: 5.5-9.5 pH  
-- **Emergencia**: <5.5 o >9.5 pH
+## 6. Código Fuente (Monolito v. 07-Abr-2026)
+
+```cpp
+/* ============================================================================
+   PROYECTO: SISTEMA MULTI-AGENTE DE MONITOREO HÍDRICO HELMO (PTAP)
+   NODO: AGENTE EMISOR DE pH (ID: 2)
+   ============================================================================
+   Autor: Esteban Eduardo Escarraga
+   Propósito: Captura pH, aplica filtrado, cifra con AES-128 y transmite por LoRa
+   Hardware: Heltec WiFi LoRa 32 V3 (ESP32-S3 + SX1262) + PH-4502C
+   Fecha: 07 de abril de 2026
+   DESCRIPTOR:
+   Este nodo emisor se encarga exclusivamente de adquirir la señal analógica del
+   sensor PH-4502C, convertirla a voltaje, estimar el valor de pH mediante una
+   ecuación de calibración ajustable, suavizar la medida con un filtro EMA y
+   transmitir el dato al nodo central mediante LoRa a 915 MHz con cifrado AES-128.
+   ============================================================================
+*/
