@@ -1,16 +1,33 @@
-# Análisis del Firmware: Agente Emisor de Turbidez (ID: 0)
+# Proyecto HELMO: Sistema Multi-Agente de Monitoreo Hídrico (PTAP)
+## Agente Emisor de Turbidez (Nodo ID: 0)
 
-Este documento detalla el funcionamiento interno del código fuente (`.ino`) del Agente de Turbidez, responsable de medir la dispersión óptica en el agua.
+Este repositorio contiene el firmware oficial para el **Agente de Turbidez**, parte del ecosistema HELMO diseñado para el monitoreo de Plantas de Tratamiento de Agua Potable (PTAP) en entornos de alta montaña. 
 
-## 1. Principio de Adquisición (Sensor Óptico)
-El agente utiliza un sensor fotoeléctrico que mide la cantidad de luz infrarroja transmitida a través del agua frente a la luz dispersada por partículas en suspensión. 
-El microcontrolador realiza múltiples lecturas analógicas (RAW) para estabilizar la medida antes de la conversión a Unidades Nefelométricas de Turbidez (NTU).
+### 1. Resumen Técnico
+El nodo realiza la adquisición de datos de turbidez mediante sensores ópticos, aplica filtrado digital avanzado (EMA), cifra los datos mediante **AES-128** y los transmite vía **LoRa** de forma eficiente.
 
-## 2. Flujo de Procesamiento en el Borde
-1.  **Muestreo:** Se capturan ráfagas de datos analógicos en el pin ADC designado.
-2.  **Conversión a NTU:** Se aplica una función polinomial o lineal de calibración para mapear el valor RAW (típicamente 0-4095 en el ESP32 de 12 bits) a NTU (0 - 3000 NTU).
-3.  **Filtrado:** Al igual que los demás nodos, puede emplear un filtro de paso bajo (EMA) para evitar picos causados por burbujas aisladas.
+### 2. Características Principales del "Monolito"
+* **Gestión de Energía "Keep-Alive":** Optimizado para Powerbanks comerciales. El ciclo de trabajo evita el auto-apagado de la fuente (5V/2.4A) al mantener un consumo constante mediante procesos activos y telemetría OLED.
+* **Seguridad de Grado Industrial:** Implementación de cifrado avanzado mediante hardware (mbedtls) para proteger la integridad de los datos hídricos en la red LoRa.
+* **Filtrado Digital EMA:** Utiliza un filtro de Media Móvil Exponencial ($EMA$) para suavizar picos de ruido en la lectura analógica:
+  $$EMA_{actual} = 0.3 \cdot NTU_{inst} + 0.7 \cdot EMA_{prev}$$
+* **Transmisión por Buffer:** Acumula 10 muestras antes de realizar el envío RF, optimizando el espectro y reduciendo el consumo pico de antena.
 
-## 3. Ensamblaje y Transmisión
-La trama se formatea estrictamente como `0,NTU,RAW` (donde `0` es el identificador `NODE_ID`). 
-El paquete se cifra utilizando la llave precompartida AES-128 en modo ECB mediante `mbedtls` y se envía a través del hardware LoRa (SX1262) configurado a 915 MHz.
+### 3. Especificaciones de Hardware
+| Componente | Detalle |
+| :--- | :--- |
+| **Microcontrolador** | Heltec WiFi LoRa 32 V3 (ESP32-S3) |
+| **Radio** | Semtech SX1262 (LoRa 915 MHz) |
+| **Sensor** | Sensor Óptico de Turbidez (Salida Analógica) |
+| **Pantalla** | OLED SSD1306 (128x64 px) |
+| **Alimentación** | Powerbank AN-P96 (5000mAh / 18.5Wh) |
+
+### 4. Configuración de Pines (Mapping)
+* **ADC Turbidez:** GPIO 4 (12-bit)
+* **Bus I2C (OLED):** SDA (17), SCL (18)
+* **Bus SPI (LoRa):** SCK (9), MISO (11), MOSI (10), CS (8)
+
+---
+
+### 5. Firmware del Agente (Monolito)
+
