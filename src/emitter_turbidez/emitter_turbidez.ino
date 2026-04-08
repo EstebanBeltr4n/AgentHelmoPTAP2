@@ -3,8 +3,8 @@
    NODO: AGENTE EMISOR DE TURBIDEZ (ID: 0)
    =============================================================
    Autor: Esteban Eduardo Escarraga
-   Propósito:
-   Hardware:
+   Propósito: Adquisición, filtrado y transmisión segura de NTU
+   Hardware: Heltec WiFi LoRa 32 V3 + Sensor Turbidez (con divisor de tensión)
    FECHA: 31 de marzo de 2026
    DESCRIPTOR: Clasificación de calidad mediante análisis óptico
    ============================================================= */
@@ -41,6 +41,11 @@ const unsigned char aes_key[16] = {
 #define TURB_AO 1             // Pin de entrada analógica (ADC)
 const float VOLT_REF = 3.3;   // Voltaje de referencia del ESP32-S3
 const int   ADC_MAX  = 4095;  // Resolución de 12 bits para mayor precisión
+
+// --- FACTOR DE CORRECCIÓN (DIVISOR DE TENSIÓN) ---
+// Compensa la reducción de 5.0V a 3.3V usando resistencias de 5.1k y 10k
+// Multiplicador: (R1 + R2) / R2 = (5.1 + 10) / 10 = 1.51
+const float FACTOR_DIVISOR = 1.51; 
 
 // --- PARÁMETROS DE CLASIFICACIÓN (UMBRALES) ---
 // Valor crítico obtenido mediante pruebas de laboratorio para agua no tratada
@@ -93,22 +98,25 @@ float mapFloat(float x, float in_min, float in_max, float out_min, float out_max
 }
 
 void loop() {
-  // 1) Adquisición de Datos: Lectura de la señal analógica del fototransistor
+  // 1) Adquisición de Datos: Lectura de la señal analógica
   int raw = analogRead(TURB_AO);
-  float volt = (raw * VOLT_REF) / ADC_MAX;
+  
+  // 2) Ajuste de Hardware: Reconstrucción del voltaje real del sensor
+  float volt_pin = (raw * VOLT_REF) / ADC_MAX;        // Voltaje leído en el pin (máx 3.3V)
+  float volt_sensor = volt_pin * FACTOR_DIVISOR;      // Voltaje original del sensor (máx 5.0V)
 
-  // 2) Procesamiento: Conversión a Unidades de Turbidez Nefelométrica (NTU)
-  // Nota: Se asume una relación lineal aproximada para fines académicos
-  float ntu = mapFloat(volt, 0.0, VOLT_REF, 0.0, 1000.0);
+  // 3) Procesamiento: Conversión a Unidades de Turbidez Nefelométrica (NTU)
+  // Mapeamos considerando el voltaje máximo real del sensor (5.0V) en lugar de 3.3V
+  float ntu = mapFloat(volt_sensor, 0.0, 5.0, 0.0, 1000.0);
   if (ntu < 0) ntu = 0;
   if (ntu > 1000) ntu = 1000;
 
-  // 3) Análisis de Tendencia (Edge Computing):
+  // 4) Análisis de Tendencia (Edge Computing):
   // Se aplica EMA (Exponential Moving Average) con factor de 0.3 para detectar cambios bruscos
   ema_ntu = 0.3 * ntu + 0.7 * ema_ntu;
   float tendencia = ntu - ema_ntu; // Diferencial de cambio
 
-  // 4) Lógica de Clasificación Binaria
+  // 5) Lógica de Clasificación Binaria
   String estadoAgua;
   if (raw >= RAW_UMBRAL_TURBIO) {
     estadoAgua = "TURBIA";
@@ -116,14 +124,14 @@ void loop() {
     estadoAgua = "LIMPIA";
   }
 
-  // 5) Construcción del Payload (Protocolo CSV Optimizado)
+  // 6) Construcción del Payload (Protocolo CSV Optimizado)
   // Formato: ID_NODO,VALOR_NTU,VALOR_RAW,VALOR_TENDENCIA
   String payload = String(NODE_ID) + "," +
                    String(ntu, 1) + "," +
                    String(raw) + "," +
                    String(tendencia, 2);
 
-  // 6) CAPA CRIPTOGRÁFICA (AES-128)
+  // 7) CAPA CRIPTOGRÁFICA (AES-128)
   // Preparación del bloque de texto plano de 32 bytes
   unsigned char plain[32] = {0};
   payload.toCharArray((char*)plain, 32);
@@ -138,20 +146,22 @@ void loop() {
   // Transmisión de largo alcance (LoRa)
   int txState = lora->transmit(enc, 32);
 
-  // 7) Telemetría vía Puerto Serial (Debug)
+  // 8) Telemetría vía Puerto Serial (Debug)
   Serial.println("---- TURBIDEZ TX ----");
-  Serial.print("RAW: ");   Serial.println(raw);
-  Serial.print("Estado: ");Serial.println(estadoAgua);
+  Serial.print("RAW ADC: "); Serial.println(raw);
+  Serial.print("Volt Pin: "); Serial.print(volt_pin); Serial.println(" V");
+  Serial.print("Volt Sensor (Reconstruido): "); Serial.print(volt_sensor); Serial.println(" V");
+  Serial.print("Estado: ");  Serial.println(estadoAgua);
   Serial.print("Payload: "); Serial.println(payload);
   Serial.print("TX estado: "); Serial.println(txState);
 
-  // 8) HMI Local: Actualización de la interfaz OLED
+  // 9) HMI Local: Actualización de la interfaz OLED
   pantalla.clear();
   pantalla.setFont(ArialMT_Plain_10);
   pantalla.drawString(0, 0, "RAW:" + String(raw));
-  pantalla.drawString(0, 12, "NTU:" + String(ntu,1));
+  pantalla.drawString(0, 12, "NTU:" + String(ntu, 1));
   pantalla.drawString(0, 24, "Est:" + estadoAgua);
-  pantalla.drawString(0, 36, "Tr:" + String(tendencia,2));
+  pantalla.drawString(0, 36, "Tr:" + String(tendencia, 2));
   pantalla.display();
 
   // Ciclo de muestreo: 2000ms (Frecuencia de 0.5 Hz)
