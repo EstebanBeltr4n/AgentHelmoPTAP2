@@ -54,8 +54,8 @@ const unsigned char aes_key[16] = {
 
 // ========= CONFIGURACIÓN DE RED (WIFI) =========
 // Credenciales de la red local para el acceso al panel de control web
-const char* WIFI_SSID = "Phepe"; 
-const char* WIFI_PASS = "bbq7W5ha";
+const char* WIFI_SSID = "iPhepe"; 
+const char* WIFI_PASS = "*******";
 
 // ========= PARÁMETROS DE EDGE COMPUTING (MACHINE LEARNING) =========
 const int ML_VENTANA_TURB = 12;       // Tamaño del buffer circular para promedios móviles
